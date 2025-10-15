@@ -6,6 +6,7 @@ from requests import Timeout
 from .result import VatNumberCheckResult
 from .xml_utils import get_first_child_element, get_text, NodeNotFoundError
 from .exceptions import ServerError
+from .utils import first_child_by_localname
 
 
 class Registry(object):
@@ -36,10 +37,175 @@ class ViesRegistry(Registry):
                             'services/checkVatService'
     """URL for the VAT checking service.
     """
+    
 
     DEFAULT_TIMEOUT = 8
     """Timeout for the requests."""
 
+    def check_vat_number_with_request_identifier(self, vat_number, requester_country_code, requester_vat_number, country_code) :
+        if country_code == 'GR':
+            country_code = 'EL'
+
+        result = VatNumberCheckResult()
+
+        # --- build SOAP for checkVatApprox (not checkVat) ---
+        def _tag(name, val):
+            # Omit empty optionals; VIES accepts missing optionals
+            return f'<ns0:{name}>{val}</ns0:{name}>' if val not in (None, "") else ''
+        requester_country_code = 'DK'
+        requester_vat_number = '43083341'
+        request_data = (
+            u'<?xml version="1.0" encoding="UTF-8"?>'
+            u'<SOAP-ENV:Envelope '
+            u'xmlns:ns0="urn:ec.europa.eu:taxud:vies:services:checkVat:types" '
+            u'xmlns:ns1="http://schemas.xmlsoap.org/soap/envelope/" '
+            u'xmlns:SOAP-ENV="http://schemas.xmlsoap.org/soap/envelope/">'
+            u'<SOAP-ENV:Header/>'
+            u'<ns1:Body>'
+            u'  <ns0:checkVatApprox>'
+            u'    <ns0:countryCode>%s</ns0:countryCode>'
+            u'    <ns0:vatNumber>%s</ns0:vatNumber>'
+            # all of these are optional; leave out unless you want to use them
+            f'    {_tag("traderName", None)}'
+            f'    {_tag("traderCompanyType", None)}'
+            f'    {_tag("traderStreet", None)}'
+            f'    {_tag("traderPostcode", None)}'
+            f'    {_tag("traderCity", None)}'
+            f'    {_tag("requesterCountryCode", requester_country_code)}'
+            f'    {_tag("requesterVatNumber", requester_vat_number)}'
+            u'  </ns0:checkVatApprox>'
+            u'</ns1:Body>'
+            u'</SOAP-ENV:Envelope>'
+        ) % (country_code, vat_number)
+
+        result.log_lines += [
+            u'> POST %s with payload of content type text/xml, charset UTF-8:',
+            request_data,
+        ]
+
+        try:
+            response = requests.post(
+                self.CHECK_VAT_SERVICE_URL,
+                data=request_data.encode('utf-8'),
+                headers={'Content-Type': 'text/xml; charset=utf-8'},
+                timeout=self.DEFAULT_TIMEOUT
+            )
+            # REMOVE: response.request_identifier (not a requests attr)
+        except Timeout as e:
+            result.log_lines.append(u'< Request to EU VIES registry timed out: {}'.format(e))
+            return result
+        except Exception as exception:
+            result.log_lines.append(u'< Request failed with exception: %r' % (exception))
+            return result
+
+        content_type = response.headers.get('Content-Type', '')
+        result.log_lines += [
+            u'< Response with status %d of content type %s:' %
+            (response.status_code, content_type),
+            response.text,
+        ]
+
+        if response.status_code != 200 or not content_type.startswith('text/xml'):
+            result.log_lines.append(u'< Response is nondeterministic due to invalid response status code or MIME type')
+            return result
+
+        # ---- Robust XML parsing (ignore prefixes) ----
+        dom = xml.dom.minidom.parseString(response.text)
+
+        envelope_node = dom.documentElement
+        # Don’t assert exact prefix; just ensure it’s an Envelope
+        env_local = getattr(envelope_node, "localName", None) or envelope_node.tagName
+        if not (env_local == "Envelope" or env_local.endswith(":Envelope")):
+            raise ValueError('expected response XML root element to be a SOAP envelope')
+
+        body_node = None
+        try:
+            # Try your original util first
+            body_node = get_first_child_element(envelope_node, 'env:Body')
+        except Exception:
+            # Fallback: prefix-agnostic
+            body_node = first_child_by_localname(envelope_node, 'Body')
+
+        # Fault handling (prefix-agnostic)
+        try:
+            # Try original
+            error_node = get_first_child_element(body_node, 'env:Fault')
+            fault_strings = error_node.getElementsByTagName('faultstring')
+            fault_code = fault_strings[0].firstChild.nodeValue
+            raise ServerError(fault_code)
+        except NodeNotFoundError:
+            # Also check by localName just in case
+            try:
+                fault_node = first_child_by_localname(body_node, 'Fault')
+                fault_strings = fault_node.getElementsByTagName('faultstring')
+                fault_code = fault_strings[0].firstChild.nodeValue
+                raise ServerError(fault_code)
+            except Exception:
+                pass
+        # response node: checkVatApproxResponse (not checkVatResponse)
+        try:
+            check_vat_response_node = get_first_child_element(body_node, 'ns2:checkVatApproxResponse')
+        except Exception:
+            check_vat_response_node = next(
+                c for c in body_node.childNodes
+                if getattr(c, "localName", "") == "checkVatApproxResponse"
+            )
+
+        # valid
+        try:
+            valid_node = get_first_child_element(check_vat_response_node, 'ns2:valid')
+        except Exception:
+            valid_node = first_child_by_localname(check_vat_response_node, 'valid')
+
+        valid_text = get_text(valid_node)
+        if valid_text in ('true', 'false'):
+            result.is_valid = (valid_text == 'true')
+        else:
+            result.log_lines.append(u'< Response is nondeterministic due to invalid validity field: %r' % (valid_text))
+
+        # traderName -> business_name
+        try:
+            try:
+                name_node = get_first_child_element(check_vat_response_node, 'ns2:traderName')
+            except Exception:
+                name_node = first_child_by_localname(check_vat_response_node, 'traderName')
+            result.business_name = (get_text(name_node) or '').strip() or None
+        except Exception:
+            pass
+
+        # traderAddress -> business_address
+        try:
+            try:
+                address_node = get_first_child_element(check_vat_response_node, 'ns2:traderAddress')
+            except Exception:
+                address_node = first_child_by_localname(check_vat_response_node, 'traderAddress')
+            result.business_address = (get_text(address_node) or '').strip() or None
+        except Exception:
+            pass
+
+        # countryCode
+        try:
+            try:
+                cc_node = get_first_child_element(check_vat_response_node, 'ns2:countryCode')
+            except Exception:
+                cc_node = first_child_by_localname(check_vat_response_node, 'countryCode')
+            result.business_country_code = (get_text(cc_node) or '').strip() or None
+        except Exception:
+            pass
+
+        # requestIdentifier  ✅ (use the correct node variable)
+        try:
+            try:
+                ri_node = get_first_child_element(check_vat_response_node, 'ns2:requestIdentifier')
+            except Exception:
+                ri_node = first_child_by_localname(check_vat_response_node, 'requestIdentifier')
+            result.request_identifier = (get_text(ri_node) or '').strip() or None
+        except Exception:
+            result.request_identifier = None
+
+        result.log_lines.append(u'< Parsed requestIdentifier: %r' % (result.request_identifier,))
+        return result
+    
     def check_vat_number(self, vat_number, country_code, test):
         # Non-ISO code used for Greece.
         if country_code == 'GR':
