@@ -15,4 +15,3 @@ def first_child_by_localname(node, localname):
                 if ln == localname or ln.endswith(":" + localname):
                     return child
         raise NodeNotFoundError(f"Child with local name '{localname}' not found")
-        
