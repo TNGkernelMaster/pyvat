@@ -79,7 +79,7 @@ class ViesRegistry(Registry):
         ) % (country_code, vat_number)
 
         result.log_lines += [
-            u'> POST %s with payload of content type text/xml, charset UTF-8:',
+            u'> POST %s with payload of content type text/xml, charset UTF-8:' % self.CHECK_VAT_SERVICE_URL,
             request_data,
         ]
 
