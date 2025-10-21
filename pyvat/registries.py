@@ -52,8 +52,6 @@ class ViesRegistry(Registry):
         def _tag(name, val):
             # Omit empty optionals; VIES accepts missing optionals
             return f'<ns0:{name}>{val}</ns0:{name}>' if val not in (None, "") else ''
-        requester_country_code = 'DK'
-        requester_vat_number = '43083341'
         request_data = (
             u'<?xml version="1.0" encoding="UTF-8"?>'
             u'<SOAP-ENV:Envelope '
