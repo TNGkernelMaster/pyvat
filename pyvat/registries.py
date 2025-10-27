@@ -1,3 +1,4 @@
+import os
 import requests
 import xml.dom.minidom
 
@@ -26,7 +27,6 @@ class Registry(object):
 
         raise NotImplementedError()
 
-
 class ViesRegistry(Registry):
     """VIES registry.
 
@@ -37,21 +37,24 @@ class ViesRegistry(Registry):
                             'services/checkVatService'
     """URL for the VAT checking service.
     """
-    
 
     DEFAULT_TIMEOUT = 8
     """Timeout for the requests."""
 
-    def check_vat_number_with_request_identifier(self, vat_number, requester_country_code, requester_vat_number, country_code) :
+    def check_vat_number_with_request_identifier(self, vat_number, requester_country_code, requester_vat_number, country_code):
+        """
+        Checks VAT number via checkVatApprox, complies with privacy logging (GDPR).
+        """
         if country_code == 'GR':
             country_code = 'EL'
 
         result = VatNumberCheckResult()
 
-        # --- build SOAP for checkVatApprox (not checkVat) ---
+        # --- build SOAP for checkVatApprox ---
         def _tag(name, val):
             # Omit empty optionals; VIES accepts missing optionals
             return f'<ns0:{name}>{val}</ns0:{name}>' if val not in (None, "") else ''
+
         request_data = (
             u'<?xml version="1.0" encoding="UTF-8"?>'
             u'<SOAP-ENV:Envelope '
@@ -76,10 +79,18 @@ class ViesRegistry(Registry):
             u'</SOAP-ENV:Envelope>'
         ) % (country_code, vat_number)
 
-        result.log_lines += [
-            u'> POST %s with payload of content type text/xml, charset UTF-8:' % self.CHECK_VAT_SERVICE_URL,
-            request_data,
-        ]
+        # GDPR/PII-aware logging
+        DEBUG_VAT_LOGS = os.environ.get("DEBUG_VAT_LOGS", "0") == "1"
+        if DEBUG_VAT_LOGS:
+            # Redact PII in logs
+            redacted_request = request_data
+            redacted_request = redacted_request.replace(vat_number, "[REDACTED-VAT]")
+            if requester_vat_number:
+                redacted_request = redacted_request.replace(requester_vat_number, "[REDACTED-REQUESTER]")
+            result.log_lines.append(u'> POST %s with payload of content type text/xml, charset UTF-8 (REDACTED).' % (self.CHECK_VAT_SERVICE_URL,))
+            result.log_lines.append(redacted_request)
+        else:
+            result.log_lines.append(u'> VIES checkVatApprox API call issued (request payload redacted for privacy)')
 
         try:
             response = requests.post(
@@ -97,11 +108,24 @@ class ViesRegistry(Registry):
             return result
 
         content_type = response.headers.get('Content-Type', '')
-        result.log_lines += [
-            u'< Response with status %d of content type %s:' %
-            (response.status_code, content_type),
-            response.text,
-        ]
+
+        # Only log full response status if debug, else only status, not body
+        if DEBUG_VAT_LOGS:
+            log_response_text = response.text
+            # Redact PII (replace VAT numbers, request identifiers)
+            log_response_text = log_response_text.replace(vat_number, "[REDACTED-VAT]")
+            if requester_vat_number:
+                log_response_text = log_response_text.replace(requester_vat_number, "[REDACTED-REQUESTER]")
+            result.log_lines.append(
+                u'< Response with status %d of content type %s (REDACTED):' %
+                (response.status_code, content_type)
+            )
+            result.log_lines.append(log_response_text)
+        else:
+            result.log_lines.append(
+                u'< VIES response status: %d, content-type: %s (response content redacted for privacy)' %
+                (response.status_code, content_type)
+            )
 
         if response.status_code != 200 or not content_type.startswith('text/xml'):
             result.log_lines.append(u'< Response is nondeterministic due to invalid response status code or MIME type')
@@ -111,28 +135,23 @@ class ViesRegistry(Registry):
         dom = xml.dom.minidom.parseString(response.text)
 
         envelope_node = dom.documentElement
-        # Don’t assert exact prefix; just ensure it’s an Envelope
         env_local = getattr(envelope_node, "localName", None) or envelope_node.tagName
         if not (env_local == "Envelope" or env_local.endswith(":Envelope")):
             raise ValueError('expected response XML root element to be a SOAP envelope')
 
         body_node = None
         try:
-            # Try your original util first
             body_node = get_first_child_element(envelope_node, 'env:Body')
         except Exception:
-            # Fallback: prefix-agnostic
             body_node = first_child_by_localname(envelope_node, 'Body')
 
         # Fault handling (prefix-agnostic)
         try:
-            # Try original
             error_node = get_first_child_element(body_node, 'env:Fault')
             fault_strings = error_node.getElementsByTagName('faultstring')
             fault_code = fault_strings[0].firstChild.nodeValue
             raise ServerError(fault_code)
         except NodeNotFoundError:
-            # Also check by localName just in case
             try:
                 fault_node = first_child_by_localname(body_node, 'Fault')
                 fault_strings = fault_node.getElementsByTagName('faultstring')
@@ -140,7 +159,7 @@ class ViesRegistry(Registry):
                 raise ServerError(fault_code)
             except Exception:
                 pass
-        # response node: checkVatApproxResponse (not checkVatResponse)
+
         try:
             check_vat_response_node = get_first_child_element(body_node, 'ns2:checkVatApproxResponse')
         except Exception:
@@ -191,7 +210,7 @@ class ViesRegistry(Registry):
         except Exception:
             pass
 
-        # requestIdentifier  ✅ (use the correct node variable)
+        # requestIdentifier
         try:
             try:
                 ri_node = get_first_child_element(check_vat_response_node, 'ns2:requestIdentifier')
@@ -201,7 +220,19 @@ class ViesRegistry(Registry):
         except Exception:
             result.request_identifier = None
 
-        result.log_lines.append(u'< Parsed requestIdentifier: %r' % (result.request_identifier,))
+        # Essential summary log (NO PII or full objects)
+        summary = (
+            u'< VIES checkVatApprox result: '
+            u'validity=%r, '
+            u'status_code=%s, '
+            u'requestIdentifier=%r'
+        ) % (
+            result.is_valid,
+            response.status_code,
+            result.request_identifier
+        )
+        result.log_lines.append(summary)
+
         return result
     
     def check_vat_number(self, vat_number, country_code, test):

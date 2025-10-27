@@ -220,7 +220,7 @@ def check_vat_number_with_request_identifier(vat_number, requester_country_code,
 
     This function validates the given VAT number, taking into account the requester's information (requester_country_code and requester_vat_number)
     as required by certain national authorities for proper auditing and evidence. When called, the function will attempt to verify the VAT number
-    and will return a VatNumberCheckResult instance containing the result of the validation. The result object also contains a 'verificationIdentifier'
+    and will return a VatNumberCheckResult instance containing the result of the validation. The result object also contains a 'request_identifier'
     (request_identifier), which serves as a unique proof of the verification that can be stored and presented to authorities should a selling company
     undergo an audit.
 
@@ -235,7 +235,7 @@ def check_vat_number_with_request_identifier(vat_number, requester_country_code,
         detection.
     :returns:
         a :class:`VatNumberCheckResult` instance containing the result for the
-        full VAT number check. The result includes a 'verificationIdentifier' that can be retained
+        full VAT number check. The result includes a 'request_identifier' that can be retained
         for compliance and audit purposes with relevant authorities.
     """
 
